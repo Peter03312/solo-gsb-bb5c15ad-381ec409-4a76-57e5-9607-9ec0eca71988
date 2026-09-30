@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS custody_event (
     content_hash       TEXT NOT NULL,                    -- 事件内容指纹（同事件号重试比对）
     created_at         TEXT NOT NULL,
     superseded_by      TEXT,                             -- 被哪条纠错作废/替换（NULL=当前有效版本）
-    replaces_event_id  TEXT                              -- 替换产生的新事件：指向被替换的原事件号
+    replaces_event_id  TEXT,                             -- 替换产生的新事件：指向被替换的原事件号
+    batch_id           TEXT REFERENCES transfer_batch(batch_id)  -- 由批量移交提交时的批次号（单事件上报为 NULL）
 );
 
 CREATE TABLE IF NOT EXISTS event_correction (
@@ -47,6 +48,16 @@ CREATE TABLE IF NOT EXISTS event_correction (
     created_at        TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS transfer_batch (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id            TEXT NOT NULL UNIQUE,            -- 全局唯一批次号
+    transferred_at      TEXT NOT NULL,                   -- 本批统一移交时间（UTC ISO8601）
+    from_custodian      TEXT NOT NULL,                   -- 交出人（全批统一）
+    to_custodian        TEXT NOT NULL,                   -- 接收人（全批统一）
+    request_hash        TEXT NOT NULL,                   -- 批次内容指纹（同批次号幂等/冲突判定）
+    created_at          TEXT NOT NULL                    -- 实际提交（落库）时间
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 """
 
@@ -54,13 +65,16 @@ CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occ
 POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_event_effective ON custody_event(sample_id, superseded_by, occurred_at)",
     "CREATE INDEX IF NOT EXISTS idx_correction_sample ON event_correction(sample_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_event_batch ON custody_event(batch_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_batch_created ON transfer_batch(created_at, id)",
 ]
 
-# 旧库（本轮纠错能力之前的版本）增量补列
+# 旧库增量补列（纠错能力：superseded_by / replaces_event_id；批量移交：batch_id）
 _MIGRATION_COLUMNS = {
     "custody_event": [
         ("superseded_by", "TEXT"),
         ("replaces_event_id", "TEXT"),
+        ("batch_id", "TEXT REFERENCES transfer_batch(batch_id)"),
     ],
 }
 

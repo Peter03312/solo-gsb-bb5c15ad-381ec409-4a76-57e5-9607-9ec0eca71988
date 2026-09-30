@@ -131,3 +131,34 @@ class ApproveIn(BaseModel):
 
     approver: str = Field(..., min_length=1, description="核定操作人")
     note: str | None = Field(None, description="核定备注")
+
+
+class BatchTransferItemIn(BaseModel):
+    """批量移交中的一份样本：样本编号 + 该份的移交单号与事件号。
+
+    移交类型固定为 transfer；统一移交时间、交出人、接收人取自批次头。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="样本编号")
+    transfer_no: str = Field(..., min_length=1, description="该份移交单号")
+    event_id: str = Field(..., min_length=1, description="该份移交的全局唯一事件号")
+
+
+class BatchTransferIn(BaseModel):
+    """同一交接车次多份样本的批量移交：一次提交，整体成败。
+
+    * 批次头（batch_id / transferred_at / from_custodian / to_custodian）全批统一；
+    * items 每份给样本编号、移交单号、事件号，逐份作为既有 transfer 事件落库；
+    * 批内样本/事件号重复、样本不存在或已核定、任一事件号已占用 → 整批失败不留痕；
+    * 同批次号同内容重试幂等（200，即使样本已核定）；同批次号异内容 → 409。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(..., min_length=1, description="全局唯一批次号，同号重试幂等")
+    transferred_at: datetime = Field(..., description="本批统一移交时间 ISO8601")
+    from_custodian: str = Field(..., min_length=1, description="交出人（全批统一，须为各样本当前保管人）")
+    to_custodian: str = Field(..., min_length=1, description="接收人（全批统一）")
+    items: list[BatchTransferItemIn] = Field(..., min_length=1, description="本批各份样本移交，至少一份")

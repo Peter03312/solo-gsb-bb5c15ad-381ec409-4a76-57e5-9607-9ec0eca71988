@@ -8,16 +8,19 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .db import db_session, init_db, row_to_dict
-from .schemas import ApproveIn, CorrectionIn, EventIn, SampleIn
+from .schemas import ApproveIn, BatchTransferIn, CorrectionIn, EventIn, SampleIn
 from .service import (
     DomainError,
     approve_storage,
+    build_batch_view,
     create_event,
     evaluate,
+    get_batch_or_404,
     get_sample_or_404,
     list_corrections,
     register_sample,
     submit_correction,
+    submit_transfer_batch,
 )
 
 API_PREFIX = "/api/v1"
@@ -40,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验与入库核定",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -161,6 +164,32 @@ def create_event_api(data: EventIn) -> JSONResponse:
             "idempotent": idempotent,
         }
     return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+# --------------------------------------------------------------------------- 批量移交
+
+@app.post(f"{API_PREFIX}/transfer-batches", tags=["transfer-batches"], status_code=201)
+def submit_transfer_batch_api(data: BatchTransferIn) -> JSONResponse:
+    """同一交接车次多份样本移交：一次提交，逐份作为既有 transfer 事件落库，整体成败。
+
+    * 批内样本/事件号重复、样本不存在或已核定、任一事件号已占用 → 整批失败，不留事件或批次；
+    * 同批次号同内容重试 → 200 幂等（即使样本已核定）；同批次号异内容 → 409 batch_conflict；
+    * 响应 items 逐份给当前核验结论（evaluation）与原事件是否仍有效（event_effective）。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = submit_transfer_batch(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/transfer-batches/{{batch_id}}", tags=["transfer-batches"])
+def get_transfer_batch_api(batch_id: str) -> dict[str, Any]:
+    """批次查询：逐份样本的当前核验结论，以及批次原移交事件是否仍在有效链上。
+
+    后续纠错作废/替换只改变有效链与本查询结果；批次头与事件原始归属（batch_id）不变。
+    """
+    with db_session() as conn:
+        batch = get_batch_or_404(conn, batch_id)
+        return build_batch_view(conn, batch)
 
 
 # --------------------------------------------------------------------------- 事件纠错
