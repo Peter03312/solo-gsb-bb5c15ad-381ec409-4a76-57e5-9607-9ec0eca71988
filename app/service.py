@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import config
-from .schemas import ApproveIn, CorrectionIn, EventIn, NewEventIn, SampleIn
+from .schemas import ApproveIn, CorrectionIn, EventIn, NewEventIn, SampleIn, TransferBatchIn
 
 LAB_CUSTODIAN = "实验室"
 
@@ -62,6 +62,24 @@ def ensure_unlocked(sample: sqlite3.Row) -> None:
             "history_locked",
             f"样本 {sample['sample_code']} 已核定入库（{sample['approved_storage_at']}），历史记录冻结，禁止改写",
         )
+
+
+def evaluation_summary(result: dict[str, Any], sample: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """从 evaluate 结果与样本行抽取对外的核验摘要（列表/批次等多处复用）。"""
+    return {
+        "sample_code": result["sample_code"],
+        "status": result["status"],
+        "reasons": result["reasons"],
+        "current_custodian": result["current_custodian"],
+        "pending_transfer": result["pending_transfer"],
+        "has_storage": result["has_storage"],
+        "event_count": result["event_count"],
+        "collected_at": sample["collected_at"],
+        "collector": sample["collector"],
+        "seal_no": sample["seal_no"],
+        "approved_storage_at": sample["approved_storage_at"],
+        "approved_by": sample["approved_by"],
+    }
 
 
 # --------------------------------------------------------------------------- 样本登记
@@ -253,6 +271,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                 "recorded_at": ev["created_at"],
                 "payload": p,
                 "replaces_event_id": ev["replaces_event_id"],
+                "batch_id": ev["batch_id"],
             }
         )
 
@@ -373,6 +392,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
             "payload": json.loads(ev["payload_json"]),
             "superseded_by": ev["superseded_by"],
             "replaces_event_id": ev["replaces_event_id"],
+            "batch_id": ev["batch_id"],
         }
         for ev in superseded_rows
     ]
@@ -579,3 +599,254 @@ def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn)
     result["approved_storage_at"] = approved_at
     result["approval"] = {"approved": True, "approved_at": approved_at, "approver": data.approver, "note": data.note}
     return result
+
+
+# --------------------------------------------------------------------------- 批量移交（同一交接车次多份样本）
+
+def _batch_fingerprint(data: TransferBatchIn) -> tuple[str, str]:
+    """返回 (规范后的统一移交时间 UTC ISO, 整批内容指纹)。
+
+    指纹对 items 的提交顺序不敏感（按样本编号/事件号归一化排序）；
+    批内重复编号属于请求不合法，由提交函数另行判定（不进入幂等/冲突语义）。
+    """
+    occurred = to_utc_iso(data.occurred_at)
+    items = sorted(
+        (
+            {"sample_code": it.sample_code, "transfer_no": it.transfer_no, "event_id": it.event_id}
+            for it in data.items
+        ),
+        key=lambda x: (x["sample_code"], x["event_id"]),
+    )
+    canonical = {
+        "batch_id": data.batch_id,
+        "occurred_at": occurred,
+        "from_custodian": data.from_custodian,
+        "to_custodian": data.to_custodian,
+        "items": items,
+    }
+    return occurred, _fingerprint(canonical)
+
+
+def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tuple[dict[str, Any], bool]:
+    """同一交接车次多份样本一次提交：各份均作为既有 transfer 事件原子落库。
+
+    返回 (批次查询视图, 是否幂等重试)。整批语义：
+      * 批内样本编号/事件号重复、样本不存在、样本已核定、任一事件号已占用
+        → 整个批次失败，事务回滚，不留下事件或批次；
+      * 同批次号同内容重试 → 幂等返回 200（即使样本此后已核定）；
+      * 同批次号异内容 → 409 batch_conflict；
+      * 并发提交以 BEGIN IMMEDIATE 持锁顺序串行判定（事件号唯一键兜底）。
+    """
+    from .db import utcnow_iso
+
+    occurred, request_hash = _batch_fingerprint(data)
+
+    # 1) 同批次号：同内容幂等 / 异内容冲突。优先于一切业务校验，
+    #    与既有事件接口一致——核定后同号同内容重试仍 200。
+    existing = conn.execute(
+        "SELECT * FROM transfer_batch WHERE batch_id = ?", (data.batch_id,)
+    ).fetchone()
+    if existing is not None:
+        if existing["request_hash"] != request_hash:
+            raise DomainError(
+                409,
+                "batch_conflict",
+                f"批次号 {data.batch_id} 已使用但提交内容不一致（同批次号异内容冲突）",
+                {"batch_id": data.batch_id,
+                 "existing_request_hash": existing["request_hash"],
+                 "incoming_request_hash": request_hash},
+            )
+        return get_transfer_batch(conn, data.batch_id), True
+
+    # 2) 整批预校验：任一份不通过即整体拒绝（此刻尚未写入任何行）。
+    #    conflict_items（已核定/事件号占用）优先 → 409；其余（批内重复/样本不存在）→ 422。
+    conflict_items: list[dict[str, Any]] = []
+    invalid_items: list[dict[str, Any]] = []
+    seen_samples: dict[str, int] = {}
+    seen_events: dict[str, int] = {}
+    sample_rows: dict[str, sqlite3.Row] = {}
+
+    for idx, it in enumerate(data.items):
+        if it.sample_code in seen_samples:
+            invalid_items.append({
+                "index": idx, "sample_code": it.sample_code, "event_id": it.event_id,
+                "code": "duplicate_sample_in_batch",
+                "message": f"批内样本编号重复：{it.sample_code}"
+                           f"（第 {seen_samples[it.sample_code] + 1} 份与第 {idx + 1} 份）",
+            })
+        else:
+            seen_samples[it.sample_code] = idx
+        if it.event_id in seen_events:
+            invalid_items.append({
+                "index": idx, "sample_code": it.sample_code, "event_id": it.event_id,
+                "code": "duplicate_event_in_batch",
+                "message": f"批内事件号重复：{it.event_id}"
+                           f"（第 {seen_events[it.event_id] + 1} 份与第 {idx + 1} 份）",
+            })
+        else:
+            seen_events[it.event_id] = idx
+
+        srow = conn.execute(
+            "SELECT * FROM sample WHERE sample_code = ?", (it.sample_code,)
+        ).fetchone()
+        if srow is None:
+            invalid_items.append({
+                "index": idx, "sample_code": it.sample_code, "event_id": it.event_id,
+                "code": "sample_not_found",
+                "message": f"样本不存在: {it.sample_code}",
+            })
+            continue
+        sample_rows[it.sample_code] = srow
+
+        if config.LOCK_AFTER_APPROVAL and srow["approved_storage_at"]:
+            conflict_items.append({
+                "index": idx, "sample_code": it.sample_code, "event_id": it.event_id,
+                "code": "sample_approved",
+                "message": f"样本 {it.sample_code} 已核定入库（{srow['approved_storage_at']}），禁止追加移交",
+            })
+        occupied = conn.execute(
+            "SELECT 1 FROM custody_event WHERE event_id = ?", (it.event_id,)
+        ).fetchone()
+        if occupied is not None:
+            conflict_items.append({
+                "index": idx, "sample_code": it.sample_code, "event_id": it.event_id,
+                "code": "event_id_occupied",
+                "message": f"事件号 {it.event_id} 已被占用",
+            })
+
+    if conflict_items or invalid_items:
+        if conflict_items:
+            raise DomainError(
+                409,
+                "batch_rejected",
+                f"批次 {data.batch_id} 存在冲突项（样本已核定/事件号占用），整批失败且不写入任何事件或批次",
+                {"batch_id": data.batch_id, "items": conflict_items + invalid_items},
+            )
+        raise DomainError(
+            422,
+            "batch_rejected",
+            f"批次 {data.batch_id} 存在不合法项（批内重复/样本不存在），整批失败且不写入任何事件或批次",
+            {"batch_id": data.batch_id, "items": invalid_items},
+        )
+
+    # 3) 全部通过：写批次头、各份既有 transfer 事件、批次明细。
+    #    在 IMMEDIATE 写事务内，批次头唯一键与事件号唯一键共同保证并发原子性：
+    #    任一插入失败（如并发抢先占用事件号）→ 整体回滚，不留批次与事件。
+    created_at = utcnow_iso()
+    bc = conn.execute(
+        "INSERT INTO transfer_batch"
+        " (batch_id, occurred_at, from_custodian, to_custodian, item_count, request_hash, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (data.batch_id, occurred, data.from_custodian, data.to_custodian,
+         len(data.items), request_hash, created_at),
+    )
+    batch_pk = bc.lastrowid
+
+    for idx, it in enumerate(data.items):
+        srow = sample_rows[it.sample_code]
+        event = EventIn(
+            event_id=it.event_id,
+            event_type="transfer",
+            sample_code=it.sample_code,
+            occurred_at=data.occurred_at,
+            transfer_no=it.transfer_no,
+            from_custodian=data.from_custodian,
+            to_custodian=data.to_custodian,
+        )
+        canonical, payload = _event_canonical(event)
+        h = _fingerprint(canonical)
+        payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        try:
+            ec = conn.execute(
+                "INSERT INTO custody_event"
+                " (sample_id, event_id, event_type, occurred_at, payload_json, content_hash,"
+                "  created_at, superseded_by, replaces_event_id, batch_id)"
+                " VALUES (?,?,?,?,?,?,?,NULL,NULL,?)",
+                (srow["id"], it.event_id, "transfer", occurred, payload_json, h,
+                 created_at, data.batch_id),
+            )
+        except sqlite3.IntegrityError:
+            raise DomainError(
+                409,
+                "batch_rejected",
+                f"批次 {data.batch_id} 并发提交冲突：事件号 {it.event_id} 已被占用，整批失败",
+                {"batch_id": data.batch_id,
+                 "items": [{"index": idx, "sample_code": it.sample_code,
+                            "event_id": it.event_id, "code": "event_id_occupied"}]},
+            )
+        conn.execute(
+            "INSERT INTO transfer_batch_item"
+            " (batch_pk, sample_id, sample_code, transfer_no, event_id, event_row_id, item_index)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (batch_pk, srow["id"], it.sample_code, it.transfer_no,
+             it.event_id, ec.lastrowid, idx),
+        )
+
+    return get_transfer_batch(conn, data.batch_id), False
+
+
+def _effective_event_id(conn: sqlite3.Connection, row_id: int) -> str | None:
+    """沿替换链（replaces_event_id）走到当前有效版本事件号。
+
+    原事件仍有效 → 返回原事件号；经 replace 链最终版本有效 → 返回最终事件号；
+    被 void 作废（无替换后继）或链终点已失效 → None。
+    """
+    first = conn.execute("SELECT event_id FROM custody_event WHERE id = ?", (row_id,)).fetchone()
+    current_evt = first["event_id"]
+    while True:
+        cur = conn.execute(
+            "SELECT superseded_by FROM custody_event WHERE event_id = ?", (current_evt,)
+        ).fetchone()
+        if cur["superseded_by"] is None:
+            return current_evt
+        child = conn.execute(
+            "SELECT event_id FROM custody_event WHERE replaces_event_id = ? ORDER BY id ASC",
+            (current_evt,),
+        ).fetchone()
+        if child is None:
+            return None
+        current_evt = child["event_id"]
+
+
+def get_transfer_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
+    """批次查询：批次头 + 逐份样本的当前核验结论与原事件是否仍有效。
+
+    后续纠错（作废/替换）只改变有效链与本查询结果；批次头与明细的原始归属永久留痕。
+    """
+    batch = conn.execute(
+        "SELECT * FROM transfer_batch WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    if batch is None:
+        raise DomainError(404, "batch_not_found", f"批次不存在: {batch_id}")
+
+    items: list[dict[str, Any]] = []
+    item_rows = conn.execute(
+        "SELECT * FROM transfer_batch_item WHERE batch_pk = ? ORDER BY item_index ASC",
+        (batch["id"],),
+    ).fetchall()
+    for it in item_rows:
+        sample = conn.execute("SELECT * FROM sample WHERE id = ?", (it["sample_id"],)).fetchone()
+        result = evaluate(conn, sample)
+        orig = conn.execute(
+            "SELECT superseded_by FROM custody_event WHERE id = ?", (it["event_row_id"],)
+        ).fetchone()
+        items.append({
+            "index": it["item_index"],
+            "sample_code": it["sample_code"],
+            "transfer_no": it["transfer_no"],
+            "event_id": it["event_id"],
+            "event_effective": orig["superseded_by"] is None,
+            "superseded_by": orig["superseded_by"],
+            "current_event_id": _effective_event_id(conn, it["event_row_id"]),
+            "evaluation": evaluation_summary(result, sample),
+        })
+
+    return {
+        "batch_id": batch["batch_id"],
+        "occurred_at": batch["occurred_at"],
+        "from_custodian": batch["from_custodian"],
+        "to_custodian": batch["to_custodian"],
+        "item_count": batch["item_count"],
+        "created_at": batch["created_at"],
+        "items": items,
+    }

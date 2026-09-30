@@ -7,11 +7,12 @@
     python examples/call_api.py
 """
 import json
+import os
 import urllib.error
 import urllib.request
 import uuid
 
-BASE = "http://127.0.0.1:8080/api/v1"
+BASE = os.getenv("API_BASE", "http://127.0.0.1:8080/api/v1")
 
 
 def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
@@ -203,6 +204,83 @@ def main() -> None:
     show("纠错-作废（原记录留痕、核验剔除）", s, r, "evaluation", "status")
     s, r = call("GET", f"/samples/{code2}/corrections")
     show("纠错审计查询", s, r)
+
+    # 12) 批量移交：同一交接车次多份样本一次提交
+    run_b = uuid.uuid4().hex[:8]
+    b_codes = [f"API-BATCH-{run_b}-{i}" for i in (1, 2, 3)]
+    for i, bc in enumerate(b_codes):
+        call("POST", "/samples", {
+            "sample_code": bc,
+            "collected_at": "2026-09-30T01:00:00Z",
+            "collector": "王采集",
+            "seal_no": f"SEAL-BATCH-{run_b}-{i}",
+        })
+
+    batch_body = {
+        "batch_id": f"API-BATCH-{run_b}",
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "from_custodian": "王采集",
+        "to_custodian": "李运输",
+        "items": [
+            {"sample_code": b_codes[0], "transfer_no": f"TR-B-{run_b}-1",
+             "event_id": f"API-BEVT-{run_b}-1"},
+            {"sample_code": b_codes[1], "transfer_no": f"TR-B-{run_b}-2",
+             "event_id": f"API-BEVT-{run_b}-2"},
+            {"sample_code": b_codes[2], "transfer_no": f"TR-B-{run_b}-3",
+             "event_id": f"API-BEVT-{run_b}-3"},
+        ],
+    }
+    s, r = call("POST", "/transfer-batches", batch_body)
+    show("批量移交提交（201，逐份核验结论）", s, r, "batch", "item_count")
+    for it in r.get("batch", {}).get("items", []):
+        print(f"    {it['sample_code']}: {it['evaluation']['status']}"
+              f"（原事件有效={it['event_effective']}）")
+
+    # 12.1) 同批次号同内容重试 → 200 幂等（顺序变化也识别为同内容）
+    batch_body["items"] = list(reversed(batch_body["items"]))
+    s, r = call("POST", "/transfer-batches", batch_body)
+    show("同批次号同内容重试（200 幂等）", s, r, "idempotent")
+
+    # 12.2) 同批次号异内容 → 409 batch_conflict
+    bad = json.loads(json.dumps(batch_body, ensure_ascii=False))
+    bad["items"][0]["transfer_no"] = "TR-CHANGED"
+    s, r = call("POST", "/transfer-batches", bad)
+    show("同批次号异内容（409 batch_conflict）", s, r)
+
+    # 12.3) 整批失败示例：批内样本重复 / 事件号已占用 → 不留批次与事件
+    bad2 = {
+        "batch_id": f"API-BATCH-BAD-{run_b}",
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "from_custodian": "王采集", "to_custodian": "李运输",
+        "items": [
+            {"sample_code": b_codes[0], "transfer_no": "TR-X1",
+             "event_id": f"API-BEVT-{run_b}-9"},
+            {"sample_code": b_codes[0], "transfer_no": "TR-X2",
+             "event_id": f"API-BEVT-{run_b}-1"},  # 批内样本重复 + 事件号已占用
+        ],
+    }
+    s, r = call("POST", "/transfer-batches", bad2)
+    show("整批失败（409/422 batch_rejected，逐项给出）", s, r)
+
+    # 12.4) 批次查询：逐份当前结论与原事件是否仍有效
+    s, r = call("GET", f"/transfer-batches/API-BATCH-{run_b}")
+    show("批次查询", s, r, "batch", "item_count")
+
+    # 12.5) 作废其中一份移交后再查：只改有效链与查询结果，批次原始归属仍在
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-B-{run_b}",
+        "sample_code": b_codes[1],
+        "target_event_id": f"API-BEVT-{run_b}-2",
+        "action": "void",
+        "operator": "质控员",
+        "reason": "该份误上车次，作废移交",
+    })
+    show("作废批内一份移交", s, r, "evaluation", "status")
+    s, r = call("GET", f"/transfer-batches/API-BATCH-{run_b}")
+    print(f"\n--- 纠错后批次查询 [HTTP {s}] ---")
+    for it in r.get("batch", {}).get("items", []):
+        print(f"    {it['sample_code']}: 原事件 {it['event_id']} 有效={it['event_effective']}"
+              f" 当前有效事件={it['current_event_id']} 结论={it['evaluation']['status']}")
 
 
 if __name__ == "__main__":
